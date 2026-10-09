@@ -77,16 +77,27 @@ if [[ -t 1 ]]; then
   fi
 fi
 
-# Only allow script to run as root
-if (( EUID != 0 )); then
-  echo -e "${red}This script needs to be run as root. Try again with 'sudo $0'${nc}"
-  exit 1
+# Root is required to persist results under /opt/piavpn-manual and to
+# fetch a token / establish a VPN connection. Without root, the script
+# still runs as a read-only latency checker: it prints the same live
+# progress and a best-region/server summary, but writes no files and
+# does not attempt to connect.
+if (( EUID == 0 )); then
+  runningAsRoot="true"
+else
+  runningAsRoot="false"
+  echo -e "${red}Running without root: performing a read-only latency check only.${nc}"
+  echo "No files will be written under /opt/piavpn-manual and no VPN connection will be made."
+  echo "Re-run with sudo to save results and/or connect."
+  echo
 fi
 
-mkdir -p /opt/piavpn-manual
-# Erase old latencyList file
-rm -f /opt/piavpn-manual/latencyList
-touch /opt/piavpn-manual/latencyList
+if [[ $runningAsRoot == "true" ]]; then
+  mkdir -p /opt/piavpn-manual
+  # Erase old latencyList file
+  rm -f /opt/piavpn-manual/latencyList
+  touch /opt/piavpn-manual/latencyList
+fi
 
 # This allows you to set the maximum allowed latency in seconds.
 # All servers that respond slower than this will be ignored.
@@ -97,6 +108,23 @@ export MAX_LATENCY
 
 serverlist_url='https://serverlist.piaservers.net/vpninfo/servers/v6'
 
+# Prints the TCP connect time to a PIA server, trying 443 first and then the
+# ports that also accept TCP. Returns 1 if none of them connect.
+measureConnectTime() {
+  local serverIP=$1 timeout=$2 port connectTime
+  for port in 443 8080 1337; do
+    connectTime=$(LC_NUMERIC=en_US.utf8 curl -o /dev/null -s \
+      --connect-timeout "$timeout" \
+      --write-out "%{time_connect}" \
+      "http://$serverIP:$port")
+    if [[ $? -eq 0 ]]; then
+      echo "$connectTime"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # This function checks the latency you have to a specific region.
 # It will print a human-readable message to stderr,
 # and it will print the variables to stdout
@@ -105,21 +133,21 @@ printServerLatency() {
   regionID=$2
   regionName="$(echo "${@:3}" |
     sed 's/ false//' | sed 's/true/(geo)/')"
-  time=$(LC_NUMERIC=en_US.utf8 curl -o /dev/null -s \
-    --connect-timeout "$MAX_LATENCY" \
-    --write-out "%{time_connect}" \
-    "http://$serverIP:443")
+  time=$(measureConnectTime "$serverIP" "$MAX_LATENCY")
   if [[ $? -eq 0 ]]; then
     >&2 echo "Got latency ${time}s for region: $regionName"
     echo "$time $regionID $serverIP"
-    # Write a list of servers with acceptable latency
-    # to /opt/piavpn-manual/latencyList
-    echo -e "$time" "$regionID"'\t'"$serverIP"'\t'"$regionName" >> /opt/piavpn-manual/latencyList
+    if [[ $runningAsRoot == "true" ]]; then
+      # Write a list of servers with acceptable latency
+      # to /opt/piavpn-manual/latencyList
+      echo -e "$time" "$regionID"'\t'"$serverIP"'\t'"$regionName" >> /opt/piavpn-manual/latencyList
+    fi
   fi
-  # Sort the latencyList, ordered by latency
-  sort -no /opt/piavpn-manual/latencyList /opt/piavpn-manual/latencyList
+  if [[ $runningAsRoot == "true" ]]; then
+    # Sort the latencyList, ordered by latency
+    sort -no /opt/piavpn-manual/latencyList /opt/piavpn-manual/latencyList
+  fi
 }
-export -f printServerLatency
 
 # If a server location or autoconnect isn't specified, set the variable to false/no.
 if [[ -z $PREFERRED_REGION ]]; then
@@ -160,9 +188,18 @@ if [[ $selectedRegion == "none" ]]; then
   fi
   echo -e Testing regions that respond \
     faster than "${green}$MAX_LATENCY${nc}" seconds:
-  selectedRegion="$(echo "$summarized_region_data" |
-    xargs -I{} bash -c 'printServerLatency {}' |
-    sort | head -1 | awk '{ print $2 }')"
+  bestRegionLine="$(
+    while read -r line; do
+      # Intentionally unquoted to word-split the line into positional args
+      # for printServerLatency, matching the previous xargs behavior, but
+      # calling the function directly (never through a nested shell string)
+      # so untrusted region data can never be interpreted as shell syntax.
+      # shellcheck disable=SC2086
+      printServerLatency $line
+    done <<< "$summarized_region_data" |
+    sort | head -1)"
+  selectedRegion=$(awk '{ print $2 }' <<< "$bestRegionLine")
+  selectedRegionLatency=$(awk '{ print $1 }' <<< "$bestRegionLine")
   echo
 
   if [[ -z $selectedRegion ]]; then
@@ -170,7 +207,7 @@ if [[ $selectedRegion == "none" ]]; then
     echo "For example, to wait 1 second for each region, inject MAX_LATENCY=1 like this:"
     echo -e "$ MAX_LATENCY=1 ./get_region.sh${nc}"
     exit 1
-  else
+  elif [[ $runningAsRoot == "true" ]]; then
     echo -e "A list of servers and connection details, ordered by latency can be
 found in at : ${green}/opt/piavpn-manual/latencyList${nc}
 "
@@ -191,9 +228,23 @@ bestServer_OT_hostname=$(echo "$regionData" | jq -r '.servers.ovpntcp[0].cn')
 bestServer_OU_IP=$(echo "$regionData" | jq -r '.servers.ovpnudp[0].ip')
 bestServer_OU_hostname=$(echo "$regionData" | jq -r '.servers.ovpnudp[0].cn')
 
+# A manually pinned region (PREFERRED_REGION) was never latency-tested during
+# a scan, so measure it here. Use a generous fixed timeout rather than
+# $MAX_LATENCY: that variable exists to filter out slow regions during
+# auto-select, whereas a manually chosen region should be measured, not
+# rejected, even if it's slow.
+if [[ $selectedOrLowestLatency == "selected" ]]; then
+  selectedRegionLatency=$(measureConnectTime "$bestServer_meta_IP" 5) || selectedRegionLatency=""
+fi
 
-if [[ $VPN_PROTOCOL == "no" ]]; then
+
+if [[ $VPN_PROTOCOL == "no" || $runningAsRoot == "false" ]]; then
   echo -ne "The $selectedOrLowestLatency region is ${green}$(echo "$regionData" | jq -r '.name')${nc}"
+  if [[ -n $selectedRegionLatency ]]; then
+    echo -n " (latency: ${green}${selectedRegionLatency}s${nc})"
+  else
+    echo -n " (latency: ${red}unreachable within 5s${nc})"
+  fi
   if echo "$regionData" | jq -r '.geo' | grep true > /dev/null; then
     echo " (geolocated region)."
   else
@@ -206,11 +257,20 @@ the SSL/TLS certificate actually contains the hostname so that you
 are sure you are connecting to a secure server, validated by the
 PIA authority. Please find below the list of best IPs and matching
 hostnames for each protocol:
-${green}Meta Services $bestServer_meta_IP\t-     $bestServer_meta_hostname
-WireGuard     $bestServer_WG_IP\t-     $bestServer_WG_hostname
-OpenVPN TCP   $bestServer_OT_IP\t-     $bestServer_OT_hostname
-OpenVPN UDP   $bestServer_OU_IP\t-     $bestServer_OU_hostname
+${green}Meta Services $bestServer_meta_IP:443\t-     $bestServer_meta_hostname
+WireGuard     $bestServer_WG_IP:1337\t-     $bestServer_WG_hostname
+OpenVPN TCP   $bestServer_OT_IP:8443\t-     $bestServer_OT_hostname
+OpenVPN UDP   $bestServer_OU_IP:8080\t-     $bestServer_OU_hostname
 ${nc}"
+fi
+
+if [[ $runningAsRoot == "false" ]]; then
+  if [[ $VPN_PROTOCOL != "no" ]]; then
+    echo
+    echo -e "${red}Root is required to fetch a token and establish a VPN connection.${nc}"
+    echo "Re-run this script with sudo (and the same env vars) to connect."
+  fi
+  exit 0
 fi
 
 # The script will check for an authentication token, and use it if present

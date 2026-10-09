@@ -13,6 +13,7 @@ The scripts were written so that they are easy to read and to modify. The code a
 ## Table of Contents
 
 - [Dependencies](#dependencies)
+- [Network requirements](#network-requirements)
 - [Disclaimers](#disclaimers)
 - [Confirmed distributions](#confirmed-distributions)
 - [3rd Party Repositories](#3rd-party-repositories)
@@ -29,6 +30,39 @@ In order for the scripts to work (probably even if you do a manual setup), you w
  * `jq`
  * (only for WireGuard) `wireguard-tools` (`wg-quick` and `wireguard` kernel module)
  * (only for OpenVPN) `openvpn`
+
+## Network requirements
+
+If you run these scripts behind a firewall, the endpoints below must be reachable from the host before the tunnel comes up. Once the tunnel is up, traffic is routed through it.
+
+Before the tunnel (host network):
+
+| Purpose | Protocol / port | Destination | Used by |
+|---|---|---|---|
+| Account token | TCP 443 (HTTPS) | `www.privateinternetaccess.com` (`/api/client/v2/token`) | `get_token.sh` |
+| Dedicated IP lookup | TCP 443 (HTTPS) | `www.privateinternetaccess.com` (`/api/client/v2/dedicated_ip`) | `get_dip.sh` |
+| Server list | TCP 443 (HTTPS) | `serverlist.piaservers.net` | `get_region.sh` (every run) |
+| Latency probe | TCP 443 (connect only) | Each region's meta IP (`servers.meta[].ip`) | `get_region.sh` |
+| OpenVPN UDP | UDP 8080 | `servers.ovpnudp[].ip` | `connect_to_openvpn_with_token.sh` |
+| OpenVPN TCP | TCP 8443 | `servers.ovpntcp[].ip` | `connect_to_openvpn_with_token.sh` |
+| WireGuard key registration | TCP 1337 (HTTPS) | `servers.wg[].ip` | `connect_to_wireguard_with_token.sh` |
+| WireGuard tunnel | UDP, port from the `server_port` field of the `addKey` response | `servers.wg[].ip` | `wg-quick` |
+| DNS | UDP/TCP 53 | Your resolver, for the hostnames above | `get_token.sh`, `get_region.sh` |
+
+Inside the tunnel (no host firewall rule needed):
+
+| Purpose | Protocol / port | Destination | Used by |
+|---|---|---|---|
+| Port forwarding | TCP 19999 (HTTPS) | `PF_GATEWAY`, the private gateway IP from the tunnel | `port_forwarding.sh` |
+
+Notes:
+- `connect_to_wireguard_with_token.sh` and `port_forwarding.sh` pin each server's hostname to its IP with `curl --connect-to`, so per-server hostnames do not need DNS.
+- The WireGuard UDP port is not hardcoded. It comes from the `server_port` field in the `addKey` response.
+- The IP addresses change over time. To list the current set:
+  ```
+  curl -s https://serverlist.piaservers.net/vpninfo/servers/v6 | head -1 | jq -r '.regions[].servers | (.meta[]?, .wg[]?, .ovpntcp[]?, .ovpnudp[]?) | .ip' | sort -u
+  ```
+- The latency probe and the server list request run before the tunnel exists. If your firewall blocks TCP 443 to the meta IPs, `get_region.sh` cannot measure latency.
 
 ## Disclaimers
 
