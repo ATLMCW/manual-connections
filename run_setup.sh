@@ -46,6 +46,22 @@ fi
 # Erase previous authentication token if present
 rm -f /opt/piavpn-manual/token /opt/piavpn-manual/latencyList
 
+# If a saved credentials file exists (the same 2-line file renew_wireguard.sh
+# uses -- line 1 username, line 2 password, no PIA_USER=/PIA_PASS= labels),
+# use it instead of prompting, unless PIA_USER/PIA_PASS were already supplied
+# via env var.
+: "${PIA_RENEW_CREDENTIALS_FILE:=/opt/piavpn-manual/renew_wireguard_credentials}"
+if [[ -z $PIA_USER || -z $PIA_PASS ]] && [[ -f $PIA_RENEW_CREDENTIALS_FILE ]]; then
+  credPerms=$(stat -L -c '%a' "$PIA_RENEW_CREDENTIALS_FILE")
+  if [[ $credPerms != "600" && $credPerms != "400" ]]; then
+    echo -e "${red}Warning: $PIA_RENEW_CREDENTIALS_FILE is readable by non-root users (mode $credPerms)."
+    echo -e "It contains your PIA password. Run: chmod 600 $PIA_RENEW_CREDENTIALS_FILE${nc}"
+  fi
+  : "${PIA_USER:=$(awk 'NR == 1' "$PIA_RENEW_CREDENTIALS_FILE")}"
+  : "${PIA_PASS:=$(awk 'NR == 2' "$PIA_RENEW_CREDENTIALS_FILE")}"
+  echo -e "${green}Using saved credentials from $PIA_RENEW_CREDENTIALS_FILE.${nc}"
+fi
+
 # Retry login if no token is generated
 while :; do
     while :; do
@@ -473,6 +489,10 @@ elif [[ $VPN_PROTOCOL == wireguard ]]; then
   echo "WG_SERVER_IP=$dipAddress WG_HOSTNAME=$dipHostname" \\
   echo -e "./connect_to_wireguard_with_token.sh${nc}"
   echo
+  # Record the server we're connecting to so renew_wireguard.sh can later
+  # reconnect to the same one without the user having to note it down.
+  echo "$dipAddress" > /opt/piavpn-manual/wg_server
+  echo "$dipHostname" >> /opt/piavpn-manual/wg_server
   PIA_PF=$PIA_PF PIA_TOKEN=$PIA_TOKEN DIP_TOKEN=$DIP_TOKEN \
     WG_SERVER_IP=$dipAddress WG_HOSTNAME=$dipHostname \
     ./connect_to_wireguard_with_token.sh
